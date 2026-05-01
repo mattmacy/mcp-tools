@@ -1,1 +1,0 @@
-/tmp/mcp-tools/target/release/liblsp_rust.rlib: /tmp/mcp-tools/lsp-rust/src/lib.rs /tmp/mcp-tools/lsp-rust/src/lsp.rs /tmp/mcp-tools/lsp-rust/src/mcp.rs /tmp/mcp-tools/lsp-rust/src/rpc.rs /tmp/mcp-tools/lsp-shim-core/src/framing.rs /tmp/mcp-tools/lsp-shim-core/src/lib.rs /tmp/mcp-tools/lsp-shim-core/src/mcp_proto.rs
