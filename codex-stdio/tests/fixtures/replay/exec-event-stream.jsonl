@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"019ddac0-c151-7a21-9835-52bf1417e6cf"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"diff --git a/src/auth.rs b/src/auth.rs\nindex 8a7b6c5..9b8c7d6 100644\n--- a/src/auth.rs\n+++ b/src/auth.rs\n@@ -42,7 +42,7 @@\n-    if parts.len() != 3 {\n+    if parts.len() < 3 {\n"}}
+{"type":"turn.completed","usage":{"input_tokens":1421,"cached_input_tokens":960,"output_tokens":87,"reasoning_output_tokens":12}}

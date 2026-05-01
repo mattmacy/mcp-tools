@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/schemas/worktree-lease.v1.json",
+  "title": "Worktree Lease v1",
+  "description": "Per-worktree dispatch contract that constrains a Codex or cheap-Claude worker to a scoped set of paths and test commands. Read by .claude hooks (PreToolUse / PostToolUse) and by the worktree-merge gate to enforce path-glob and test-command boundaries. Sister branch codex-worker-allowedpaths-hook implements the enforcement; this schema defines the wire shape.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "task_id",
+    "worker",
+    "worktree",
+    "branch",
+    "allowed_paths",
+    "forbidden_paths",
+    "test_commands",
+    "merge_authority",
+    "created_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version. v1 mandates this field be the integer 1; future schema bumps will accept higher values via a separate file."
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "description": "Stable, unique identifier for the task. Used by hooks to correlate diff vs lease, and by the followup-tracker to surface lease violations."
+    },
+    "worker": {
+      "type": "string",
+      "enum": ["claude-opus", "claude-sonnet", "claude-haiku", "codex", "human"],
+      "description": "Which model (or human) owns the dispatch. Used by the routing skill to bill / cap-track the right vendor."
+    },
+    "worktree": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Absolute filesystem path to the worktree root. Reader validates it exists at lease-read time."
+    },
+    "branch": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Git branch the worker is committing on. Reader optionally cross-checks `git rev-parse --abbrev-ref HEAD` matches when validate_branch is enabled."
+    },
+    "allowed_paths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Glob patterns (supporting `*` and `**`) of repository-relative paths the worker may write. Empty array means worker may not write anything."
+    },
+    "forbidden_paths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Glob patterns the worker must not touch. Takes precedence over allowed_paths when a path matches both."
+    },
+    "test_commands": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Exact-match shell commands the worker is permitted to run via Bash. Anything else is rejected by the test-command-authorization PreToolUse hook (sister branch). Exact match (no glob, no substring) is intentional security-via-simplicity."
+    },
+    "merge_authority": {
+      "type": "string",
+      "minLength": 1,
+      "default": "torvalds-review-agent",
+      "description": "Reviewer voice authorized to PROCEED the merge. Defaults to the project's torvalds reviewer."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 / RFC 3339 timestamp the lease was issued."
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Optional ISO 8601 / RFC 3339 soft-expiry timestamp. Readers may report is_expired=true past this point; enforcement policy is up to the consumer."
+    },
+    "parent_task_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Optional task_id of the parent dispatch when this lease is a nested sub-dispatch. Out of bring-up scope; reserved field."
+    }
+  }
+}

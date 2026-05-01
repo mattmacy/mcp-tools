@@ -1,0 +1,1 @@
+/tmp/mcp-tools/target/release/codex-stdio: /tmp/mcp-tools/codex-stdio/src/codex.rs /tmp/mcp-tools/codex-stdio/src/health.rs /tmp/mcp-tools/codex-stdio/src/lib.rs /tmp/mcp-tools/codex-stdio/src/main.rs /tmp/mcp-tools/codex-stdio/src/mcp.rs /tmp/mcp-tools/codex-stdio/src/mcp_proto.rs /tmp/mcp-tools/codex-stdio/src/run_task.rs

@@ -1,0 +1,21 @@
+{
+  "id": "chatcmpl-replay-single-line-fix",
+  "object": "chat.completion",
+  "created": 1745880000,
+  "model": "gpt-5.3-codex",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "diff --git a/src/auth.rs b/src/auth.rs\nindex 8a7b6c5..9b8c7d6 100644\n--- a/src/auth.rs\n+++ b/src/auth.rs\n@@ -42,7 +42,7 @@ pub fn validate_token(token: &str) -> Result<Claims, AuthError> {\n     let parts: Vec<&str> = token.split('.').collect();\n-    if parts.len() != 3 {\n+    if parts.len() < 3 {\n         return Err(AuthError::Malformed);\n     }\n     decode_claims(parts[1])\n"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 142,
+    "completion_tokens": 87,
+    "total_tokens": 229
+  }
+}

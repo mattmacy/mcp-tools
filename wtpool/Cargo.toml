@@ -1,0 +1,42 @@
+[package]
+name = "wtpool"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only stdio MCP server exposing per-worktree git state and in-flight agent telemetry, plus a cooperative worktree lease pool. Replaces several Bash calls per cascade-merge planning round (worktree-list, log main..HEAD, status --porcelain) with cached MCP tools: worktree_list, worktree_state, agent_inflight_summary, pending_review."
+publish = false
+license = "Apache-2.0"
+
+[[bin]]
+name = "wtpool"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { version = "~4.6", features = ["derive"] }
+git2 = { version = "~0.20", default-features = false, features = ["vendored-libgit2"] }
+# Cross-platform advisory file locking (flock(2) on Unix, LockFile on Windows).
+# Used by pool_acquire to take an exclusive lock on a per-slot lockfile while
+# the slot is being claimed. The kernel auto-releases the lock when the file
+# descriptor is closed — including when the holding process crashes/exits
+# without running drop handlers — which prevents the stale-lockfile failure
+# mode that an O_EXCL-marker scheme exhibits.
+fs2 = "~0.4"
+# Used by the worktree-lease module to surface structured error
+# variants with stable wire-strings via `LeaseError::kind()`. The MCP
+# layer maps `kind()` into the JSON-RPC error response's
+# `error_kind` field so callers can branch without parsing the human
+# `Display` message.
+thiserror = { workspace = true }
+# Used by the worktree-lease writer for atomic-write-via-rename.
+# `NamedTempFile::new_in` produces collision-resistant unique names
+# via OS-managed entropy (avoids the process-id-XOR-clock-subsec
+# scheme that races under simultaneous lease emits).
+tempfile = "~3.27"
+
+[dev-dependencies]
+# tempfile is in [dependencies] (used by lease.rs atomic-write).
+# Tests share the dep automatically; no separate dev-dep entry needed.
