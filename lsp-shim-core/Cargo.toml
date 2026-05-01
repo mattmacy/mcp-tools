@@ -1,0 +1,14 @@
+[package]
+name = "lsp-shim-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared LSP wire framing + MCP JSON-RPC constants for the lsp-rust (rust-analyzer) and lsp-cpp (clangd) shim binaries. Extracts the duplicated `Content-Length` framer + the JSON-RPC method/error-code constants both shims hand-rolled (rpc.rs vs jsonrpc.rs were ~93 LOC of byte-identical wire I/O). Backend traits and the MCP serve loop still live per-shim because the two backends have divergent method signatures (file:line:col vs PathBuf, returning Value vs typed Vec<Location>); harmonising those is a follow-up."
+publish = false
+license = "Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

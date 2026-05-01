@@ -3,6 +3,9 @@ resolver = "2"
 members = [
     "codex-stdio",
     "wtpool",
+    "lsp-shim-core",
+    "lsp-rust",
+    "lsp-cpp",
 ]
 
 [workspace.dependencies]

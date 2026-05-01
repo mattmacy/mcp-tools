@@ -1,0 +1,21 @@
+[package]
+name = "lsp-cpp"
+version = "0.1.0"
+edition = "2021"
+description = "Thin LSP shim around clangd-19 with persistent index, narrow compile_commands selection, structured errors, and an MCP tool surface. Replaces buggy upstream clangd-MCP forks."
+publish = false
+license = "Apache-2.0"
+
+[[bin]]
+name = "lsp-cpp"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = "~1.0"
+lsp-shim-core = { path = "../lsp-shim-core" }
+
+[dev-dependencies]
+tempfile = "~3.27"

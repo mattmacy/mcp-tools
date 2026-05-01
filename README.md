@@ -45,19 +45,57 @@ background-index mode against a large C++ codebase whose
 Set `PROJECT_ROOT` (or the legacy `UE_ROOT`) to the directory
 containing `compile_commands.json`.
 
+### [`lsp-shim-core/`](./lsp-shim-core)
+
+Shared library used by `lsp-rust` and `lsp-cpp`. Owns the LSP
+`Content-Length`-framed JSON-RPC wire I/O (`send_frame`,
+`recv_frame`, `parse_response` with the success-vs-error
+discriminant) plus the JSON-RPC method-name and error-code constants
+the MCP outer transport emits (`initialize`, `tools/list`,
+`tools/call`, `INVALID_PARAMS`, `METHOD_NOT_FOUND`, …). Extracted
+from byte-identical copies in the two LSP shims so a framing fix
+lands once instead of twice.
+
+### [`lsp-rust/`](./lsp-rust)
+
+Long-lived MCP-over-LSP shim around `rust-analyzer`. Replaces
+`zeenix/rust-analyzer-mcp` v0.2.0. Fixes its silent-null-on-error,
+no-retry-on-`ContentModified`, hardcoded-30s-timeout,
+invisible-logging, and substring-scan-of-stderr bugs. Exposes the
+`definition` / `references` / `hover` / `workspace_symbols` /
+`diagnostics` / `wait_for_indexing` operations as both a CLI
+(per-subcommand) and an MCP stdio server (`lsp-rust serve-mcp`).
+Returns structured errors carrying `error_kind` in the JSON-RPC
+`error.data` field so callers can distinguish "succeeded with null"
+from "request failed".
+
+Pins: `clap ~4.6`. Spawns the `rust-analyzer` binary on PATH (or the
+`LSP_RUST_ANALYZER` override).
+
+### [`lsp-cpp/`](./lsp-cpp)
+
+Thin MCP-over-LSP shim around `clangd-19`. Replaces buggy upstream
+clangd-MCP forks. Long-lived clangd subprocess, persistent
+`--background-index`, narrow-vs-full `compile_commands.json`
+selection, structured errors, bounded admission queue with
+busy-vs-broken classification, and an optional post-`initialize`
+seed-didOpen step driven by `LSP_CPP_SEED_HEADERS`.
+
+Pins: `anyhow ~1.0`. Spawns `clangd-19` on PATH (or the `CLANGD_BIN`
+override).
+
 ## Build
 
 ```sh
-cargo build --release -p codex-stdio
-cargo build --release -p wtpool
+cargo build --release --workspace
 ```
 
-Binaries land at `target/release/{codex-stdio,wtpool}`.
+Binaries land at `target/release/{codex-stdio,wtpool,lsp-rust,lsp-cpp}`.
 
 ## Test
 
 ```sh
-cargo test --release
+cargo test --release --workspace
 ```
 
 ## License
