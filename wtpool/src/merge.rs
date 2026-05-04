@@ -535,6 +535,30 @@ pub fn merge_to_main(
 
     // Refresh branch_tip after rebase (commit hashes change).
     let post_rebase_branch_tip = head_sha(worktree_path)?;
+    let merge_tip_enforcement = enforce_merge_tip(
+        main_repo,
+        worktree_path,
+        req,
+        &pre_branch_tip,
+        &post_rebase_branch_tip,
+    )?;
+    if let TipEnforcement::ContentDrift {
+        reviewed_tip,
+        post_rebase_tip,
+        tree_diff_summary,
+    } = &merge_tip_enforcement
+    {
+        if std::env::var("WTPOOL_ALLOW_TIP_DRIFT").ok().as_deref() != Some("1") {
+            let envelope = json!({
+                "error": "merge_tip_drift",
+                "reviewed_tip": reviewed_tip,
+                "post_rebase_tip": post_rebase_tip,
+                "tree_diff_summary": tree_diff_summary,
+                "details": "rebase produced a content-different tree from the tip the reviewer signed; refusing merge. Set WTPOOL_ALLOW_TIP_DRIFT=1 to override.",
+            });
+            return Err(serde_json::to_string(&envelope).unwrap_or_default());
+        }
+    }
 
     // Step 4 + 5: compose message + run merge.
     let msg = compose_merge_message(req);
@@ -582,6 +606,23 @@ pub fn merge_to_main(
         "rendered_command": rendered,
         "post_rebase_branch_tip": post_rebase_branch_tip,
     });
+    if let TipEnforcement::ContentDrift {
+        reviewed_tip,
+        post_rebase_tip,
+        tree_diff_summary,
+    } = merge_tip_enforcement
+    {
+        if let Some(map) = payload.as_object_mut() {
+            map.insert(
+                "merge_tip_drift_override".into(),
+                json!({
+                    "reviewed_tip": reviewed_tip,
+                    "post_rebase_tip": post_rebase_tip,
+                    "tree_diff_summary": tree_diff_summary,
+                }),
+            );
+        }
+    }
     if !trailer_present {
         // Idempotency: merge spec + Git Safety Protocol — never undo.
         // Surface the warning, leave the merge in place.
@@ -624,6 +665,176 @@ pub(crate) fn verdict_file_path(branch: &str, voice: &str) -> PathBuf {
 fn voice_skip_for_lease(voice: &str) -> bool {
     let trimmed = voice.trim();
     trimmed.is_empty() || trimmed == "worktree-worker"
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TipEnforcement {
+    NotApplicable,
+    NoRebase,
+    ShaShiftIdenticalTree {
+        reviewed_tip: String,
+        post_rebase_tip: String,
+    },
+    ContentDrift {
+        reviewed_tip: String,
+        post_rebase_tip: String,
+        tree_diff_summary: String,
+    },
+}
+
+pub(crate) fn enforce_merge_tip(
+    main_repo: &Path,
+    worktree_path: &Path,
+    req: &MergeRequest,
+    pre_rebase_branch_tip: &str,
+    post_rebase_branch_tip: &str,
+) -> Result<TipEnforcement, String> {
+    let script = extract_verdict_script(main_repo);
+    let mut saw_verdict = false;
+    let mut outcome = TipEnforcement::NotApplicable;
+    let post_rebase_tree = rev_parse_tree(worktree_path, post_rebase_branch_tip).map_err(|e| {
+        let envelope = json!({
+            "error": "post_rebase_tip_unresolvable",
+            "post_rebase_tip": post_rebase_branch_tip,
+            "details": e,
+        });
+        serde_json::to_string(&envelope).unwrap_or_default()
+    })?;
+
+    for voice in &req.reviewer_voices {
+        if voice_skip_for_lease(voice) {
+            continue;
+        }
+        let verdict_path = verdict_file_path(&req.branch, voice.trim());
+        if !verdict_path.exists() {
+            continue;
+        }
+        saw_verdict = true;
+
+        let out = match Command::new(&script).arg(&verdict_path).output() {
+            Ok(o) => o,
+            Err(e) => {
+                let envelope = json!({
+                    "error": "verdict_parse_failed",
+                    "voice": voice.trim(),
+                    "verdict_path": verdict_path.display().to_string(),
+                    "details": format!("spawn extract-verdict.sh failed: {e}"),
+                });
+                return Err(serde_json::to_string(&envelope).unwrap_or_default());
+            }
+        };
+        if !out.status.success() {
+            let envelope = json!({
+                "error": "verdict_parse_failed",
+                "voice": voice.trim(),
+                "verdict_path": verdict_path.display().to_string(),
+                "details": String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            });
+            return Err(serde_json::to_string(&envelope).unwrap_or_default());
+        }
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let parsed: Value = serde_json::from_str(stdout.trim()).map_err(|e| {
+            let envelope = json!({
+                "error": "verdict_parse_failed",
+                "voice": voice.trim(),
+                "verdict_path": verdict_path.display().to_string(),
+                "details": format!("parse JSON from extract-verdict.sh stdout: {e}"),
+            });
+            serde_json::to_string(&envelope).unwrap_or_default()
+        })?;
+        let reviewed_tip = parsed
+            .get("tip")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                let envelope = json!({
+                    "error": "verdict_parse_failed",
+                    "voice": voice.trim(),
+                    "verdict_path": verdict_path.display().to_string(),
+                    "details": "extract-verdict.sh JSON missing top-level `tip` string",
+                });
+                serde_json::to_string(&envelope).unwrap_or_default()
+            })?
+            .to_string();
+
+        let reviewed_tree = rev_parse_tree(worktree_path, &reviewed_tip).map_err(|e| {
+            let envelope = json!({
+                "error": "verdict_tip_unresolvable",
+                "voice": voice.trim(),
+                "verdict_path": verdict_path.display().to_string(),
+                "reviewed_tip": reviewed_tip,
+                "post_rebase_tip": post_rebase_branch_tip,
+                "details": e,
+            });
+            serde_json::to_string(&envelope).unwrap_or_default()
+        })?;
+
+        if reviewed_tree == post_rebase_tree {
+            outcome = TipEnforcement::NoRebase;
+            continue;
+        }
+        if reviewed_tip == post_rebase_branch_tip {
+            if matches!(
+                outcome,
+                TipEnforcement::NotApplicable | TipEnforcement::NoRebase
+            ) {
+                outcome = TipEnforcement::ShaShiftIdenticalTree {
+                    reviewed_tip,
+                    post_rebase_tip: post_rebase_branch_tip.to_string(),
+                };
+            }
+            continue;
+        }
+
+        let tree_diff_summary = diff_stat_summary(main_repo, &reviewed_tip, post_rebase_branch_tip)
+            .unwrap_or_else(|_| "tree diff summary unavailable".to_string());
+        return Ok(TipEnforcement::ContentDrift {
+            reviewed_tip,
+            post_rebase_tip: post_rebase_branch_tip.to_string(),
+            tree_diff_summary,
+        });
+    }
+
+    if !saw_verdict {
+        return Ok(TipEnforcement::NotApplicable);
+    }
+    if pre_rebase_branch_tip == post_rebase_branch_tip
+        && matches!(outcome, TipEnforcement::NotApplicable)
+    {
+        return Ok(TipEnforcement::NoRebase);
+    }
+    Ok(outcome)
+}
+
+fn rev_parse_tree(repo: &Path, sha: &str) -> Result<String, String> {
+    let treeish = format!("{sha}^{{tree}}");
+    let out = git(repo, &["rev-parse", &treeish])?;
+    if !out.success() {
+        return Err(format!(
+            "git rev-parse {treeish} failed in {}: {}",
+            repo.display(),
+            out.stderr.trim()
+        ));
+    }
+    Ok(out.stdout.trim().to_string())
+}
+
+fn diff_stat_summary(repo: &Path, lhs: &str, rhs: &str) -> Result<String, String> {
+    let out = git(repo, &["diff", "--stat", lhs, rhs])?;
+    if !out.success() {
+        return Err(format!(
+            "git diff --stat {lhs} {rhs} failed in {}: {}",
+            repo.display(),
+            out.stderr.trim()
+        ));
+    }
+    Ok(out
+        .stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("tree contents differ")
+        .to_string())
 }
 
 /// Pre-rebase lease-compliance gate. Returns `Err(json_string)` with a

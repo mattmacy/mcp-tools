@@ -32,9 +32,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use wtpool::merge::{merge_to_main, MergeRequest, MergeStatus};
 use serde_json::Value;
 use tempfile::TempDir;
+use wtpool::merge::{merge_to_main, MergeRequest, MergeStatus};
 
 /// Configure a fresh `git2::Repository` with a deterministic identity
 /// + the `main` default-branch name.
@@ -130,6 +130,7 @@ fn write_verdict(
     verdict_dir: &Path,
     branch: &str,
     voice: &str,
+    tip: &str,
     verdict_word: &str,
     lease_compliance: Option<&str>,
 ) -> PathBuf {
@@ -139,7 +140,7 @@ fn write_verdict(
     body.push_str("schema_version: 1\n");
     body.push_str(&format!("reviewer: {voice}\n"));
     body.push_str(&format!("branch: {branch}\n"));
-    body.push_str("tip: 0000000\n");
+    body.push_str(&format!("tip: {tip}\n"));
     body.push_str("base: 1111111\n");
     body.push_str(&format!("verdict: {verdict_word}\n"));
     body.push_str("summary: synthetic test verdict\n");
@@ -163,7 +164,21 @@ fn extract_verdict_script_for_tests() -> PathBuf {
 fn env_guard() -> std::sync::MutexGuard<'static, ()> {
     use std::sync::{Mutex, OnceLock};
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-    GUARD.get_or_init(|| Mutex::new(())).lock().unwrap()
+    GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn head_sha(root: &Path) -> String {
+    git2::Repository::open(root)
+        .unwrap()
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string()
 }
 
 fn set_lease_env(verdict_dir: &Path, script: Option<&Path>) {
@@ -191,11 +206,13 @@ fn clean_lease_with_proceed_verdict_lets_merge_land() {
     let _lock = env_guard();
     let branch = "lease-clean-proceed";
     let (_tmp, root, wt) = fixture_with_branch(branch);
+    let reviewed_tip = head_sha(&wt);
     let verdict_dir = TempDir::new().unwrap();
     let _vf = write_verdict(
         verdict_dir.path(),
         branch,
         "torvalds",
+        &reviewed_tip,
         "PROCEED",
         Some("clean"),
     );
@@ -227,11 +244,13 @@ fn out_of_scope_lease_with_proceed_rejects_merge() {
     let _lock = env_guard();
     let branch = "lease-oos-proceed";
     let (_tmp, root, wt) = fixture_with_branch(branch);
+    let reviewed_tip = head_sha(&wt);
     let verdict_dir = TempDir::new().unwrap();
     let vf = write_verdict(
         verdict_dir.path(),
         branch,
         "torvalds",
+        &reviewed_tip,
         "PROCEED",
         Some("out-of-scope"),
     );
@@ -285,8 +304,16 @@ fn legacy_verdict_without_lease_field_lets_merge_land() {
     let _lock = env_guard();
     let branch = "lease-legacy-proceed";
     let (_tmp, root, wt) = fixture_with_branch(branch);
+    let reviewed_tip = head_sha(&wt);
     let verdict_dir = TempDir::new().unwrap();
-    let _vf = write_verdict(verdict_dir.path(), branch, "torvalds", "PROCEED", None);
+    let _vf = write_verdict(
+        verdict_dir.path(),
+        branch,
+        "torvalds",
+        &reviewed_tip,
+        "PROCEED",
+        None,
+    );
 
     let script = extract_verdict_script_for_tests();
     set_lease_env(verdict_dir.path(), Some(&script));
@@ -366,11 +393,13 @@ fn multi_voice_with_one_out_of_scope_rejects_merge() {
     let _lock = env_guard();
     let branch = "lease-multi-voice";
     let (_tmp, root, wt) = fixture_with_branch(branch);
+    let reviewed_tip = head_sha(&wt);
     let verdict_dir = TempDir::new().unwrap();
     let _vf_t = write_verdict(
         verdict_dir.path(),
         branch,
         "torvalds",
+        &reviewed_tip,
         "PROCEED",
         Some("clean"),
     );
@@ -378,6 +407,7 @@ fn multi_voice_with_one_out_of_scope_rejects_merge() {
         verdict_dir.path(),
         branch,
         "lattner",
+        &reviewed_tip,
         "PROCEED",
         Some("out-of-scope"),
     );
