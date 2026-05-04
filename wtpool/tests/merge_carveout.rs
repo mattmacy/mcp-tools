@@ -275,3 +275,54 @@ fn dogfood_branch_touching_merge_impl_is_not_carveout_eligible() {
         "branch touching merge.rs must require full review, got: {err}"
     );
 }
+
+
+/// Case (e): the three carveout entries added 2026-05-03 — `project/shared/**`,
+/// `tools/routing-policy.md`, and `STARTUP.md` — are carveout-eligible. Pre-fix
+/// the allowlist held only the original 3 entries, so a doc-only branch
+/// touching any of these three drove `merge_to_main` to reject empty
+/// `reviewer_voices` and force a full reviewer dispatch even for prose
+/// edits with no build surface.
+#[test]
+fn case_e_2026_05_03_additions_are_carveout_eligible() {
+    let (_tmp, root, wt) = fixture_repo(|wt| {
+        fs::create_dir_all(wt.join("project/shared")).unwrap();
+        fs::write(wt.join("project/shared/agent-ledger.md"), "# ledger
+").unwrap();
+        fs::create_dir_all(wt.join("tools")).unwrap();
+        fs::write(wt.join("tools/routing-policy.md"), "# routing
+").unwrap();
+        fs::write(wt.join("STARTUP.md"), "# startup
+").unwrap();
+    });
+
+    let v: Value = merge_to_main(&root, &wt, &req(vec![]))
+        .expect("2026-05-03 additions must be carveout-eligible");
+    assert_eq!(v["status"], MergeStatus::DryRun.as_wire());
+    let msg_path = v["proposed_message_path"].as_str().expect("path");
+    let msg = fs::read_to_string(msg_path).expect("read msg");
+    assert!(
+        msg.trim_end().ends_with("Reviewed-by: rule-13-carveout"),
+        "carveout trailer missing for 2026-05-03 additions:
+{msg}"
+    );
+    let _ = fs::remove_file(msg_path);
+}
+
+/// Case (e'): a sibling file in `tools/` (NOT `tools/routing-policy.md`)
+/// MUST NOT be carveout-eligible. Pins the exact-match semantics of the
+/// `tools/routing-policy.md` entry against accidental "tools/**" drift.
+#[test]
+fn case_e_tools_sibling_file_is_not_carveout_eligible() {
+    let (_tmp, root, wt) = fixture_repo(|wt| {
+        fs::create_dir_all(wt.join("tools")).unwrap();
+        fs::write(wt.join("tools/some-other-script.sh"), "# other
+").unwrap();
+    });
+
+    let err = merge_to_main(&root, &wt, &req(vec![])).unwrap_err();
+    assert!(
+        err.contains("reviewer-voice policy") && err.contains("carveout"),
+        "tools/ sibling must require full review (exact-match guard), got: {err}"
+    );
+}

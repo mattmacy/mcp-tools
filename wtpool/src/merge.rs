@@ -59,6 +59,15 @@ pub(crate) const RULE13_CARVEOUT_ALLOWLIST: &[&str] = &[
     "benchmark/**",
     "docs/research/**",
     "docs/plans/**",
+    // Cross-session shared planning + ledger state. No build
+    // surface, no runtime invariant; touched constantly by
+    // orchestrator + agent ledger updates.
+    "project/shared/**",
+    // Routing-policy + manual session-start checklist. Both are
+    // pure prose / parameter docs read by parent CC at session
+    // start; neither participates in any compile or test.
+    "tools/routing-policy.md",
+    "STARTUP.md",
 ];
 
 /// Trailer literal emitted in place of `Reviewed-by: <voice>` when the
@@ -135,13 +144,13 @@ pub struct MergeRequest {
 /// (e.g. a research/scope branch merging under a renamed final
 /// shape). The bypass must be explicit; accidental subject/branch
 /// mismatch is the failure mode this guards against.
-pub(crate) fn validate_request(req: &MergeRequest) -> Result<(), String> {
+pub fn validate_request(req: &MergeRequest) -> Result<(), String> {
     if req.branch.trim().is_empty() {
         return Err("merge_to_main: `branch` must be non-empty".into());
     }
     if req.merge_message_subject.len() > 72 {
         return Err(format!(
-            "merge_to_main: `merge_message_subject` is {} chars, max 72",
+            "merge_to_main: `merge_message_subject` is {} bytes (UTF-8), max 72",
             req.merge_message_subject.len()
         ));
     }

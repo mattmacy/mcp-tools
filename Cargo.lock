@@ -464,6 +464,7 @@ name = "lsp-cpp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "lsp-shim-core",
  "serde",
  "serde_json",

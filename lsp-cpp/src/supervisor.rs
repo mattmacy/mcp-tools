@@ -509,9 +509,34 @@ impl SupervisorPolicy {
             }
         }
 
+        // Backoff state: snapshot the duration before any mutation so the
+        // borrow on `self.state` is dropped before the `Stopped` reassignment
+        // below. Pre-patch this arm always returned `Wait { wait: *duration }`
+        // regardless of how long had elapsed since `record_exit` set
+        // `state_entered_ns`, so once a clangd crash drove the supervisor into
+        // Backoff every subsequent MCP request looped forever returning
+        // `Wait` — the only recovery was a full CC session restart. The
+        // expiry check below restores the documented state-machine edge
+        // `Backoff(d) -- d elapsed --> Stopped` (see the module-doc ASCII
+        // diagram around line 51) and matches the same idempotent
+        // observation pattern already used by the `Failed -> Stopped` branch.
+        if let SupervisorState::Backoff { duration } = self.state {
+            let entered_at = self.state_entered_ns.unwrap_or(now);
+            let elapsed = Duration::from_nanos(now.saturating_sub(entered_at) as u64);
+            if elapsed >= duration {
+                self.state = SupervisorState::Stopped;
+                self.state_entered_ns = Some(now);
+                return RetryDecision::Proceed;
+            } else {
+                return RetryDecision::Wait {
+                    wait: duration - elapsed,
+                };
+            }
+        }
+
         match &self.state {
             SupervisorState::Running | SupervisorState::Stopped => RetryDecision::Proceed,
-            SupervisorState::Backoff { duration } => RetryDecision::Wait { wait: *duration },
+            SupervisorState::Backoff { .. } => unreachable!("handled above"),
             SupervisorState::Failed => unreachable!("handled above"),
         }
     }
@@ -935,6 +960,81 @@ mod tests {
             sup.try_wait_total_ns(),
             0,
             "no record_try_wait_ns calls => counter stays at 0 even with state churn",
+        );
+    }
+
+    /// Regression: pre-patch `should_retry()` only handled `Failed` expiry.
+    /// `Backoff` returned `Wait { wait: duration }` indefinitely because no
+    /// branch consulted `state_entered_ns`. Once a clangd crash drove the
+    /// supervisor into Backoff, every subsequent MCP request received `Wait`
+    /// forever — recovery required a full CC session restart. This test
+    /// pins the new Backoff-expiry edge: after the duration elapses,
+    /// `should_retry()` transitions Backoff -> Stopped and returns Proceed.
+    /// Counterfactual: reverting the new `if let SupervisorState::Backoff`
+    /// branch in `should_retry()` makes the post-elapse assertion fall into
+    /// the unchanged `Wait` arm and this test fails.
+    #[test]
+    fn backoff_expires_and_returns_proceed_after_window() {
+        let (clock, now) = mock_clock();
+        let mut sup = SupervisorPolicy::with_clock(now);
+
+        // Enter Backoff via the standard spawn -> exit path. First crash
+        // yields a 1 s backoff (INITIAL_BACKOFF).
+        sup.record_spawn();
+        sup.record_exit(RestartReason::BrokenPipe);
+        let entry_state = sup.current_state().clone();
+        assert!(
+            matches!(entry_state, SupervisorState::Backoff { .. }),
+            "expected Backoff after first crash, got {entry_state:?}",
+        );
+        let backoff_duration = match entry_state {
+            SupervisorState::Backoff { duration } => duration,
+            _ => unreachable!(),
+        };
+        assert_eq!(backoff_duration, Duration::from_secs(1));
+
+        // Pre-elapse: should_retry must still report Wait, but with a
+        // shrinking remainder rather than the static full `duration`.
+        // This sub-assertion guards against the buggy "always full
+        // duration" pre-patch shape — even when there's still time left,
+        // the wait must be relative to `state_entered_ns`.
+        advance(&clock, Duration::from_millis(250));
+        match sup.should_retry() {
+            RetryDecision::Wait { wait } => {
+                assert!(
+                    wait < backoff_duration,
+                    "pre-elapse wait must shrink; backoff={backoff_duration:?} wait={wait:?}",
+                );
+                assert!(wait > Duration::ZERO, "pre-elapse wait must be > 0");
+            }
+            other => panic!("expected Wait inside backoff window, got {other:?}"),
+        }
+        // Confirm the observation did NOT mutate state — should_retry is
+        // documented as a no-op observer in the pre-elapse case.
+        assert!(
+            matches!(sup.current_state(), SupervisorState::Backoff { .. }),
+            "should_retry inside backoff window must not mutate state"
+        );
+
+        // Advance past the backoff duration. Next observation must
+        // transition Backoff -> Stopped and return Proceed.
+        advance(&clock, backoff_duration + Duration::from_millis(10));
+        match sup.should_retry() {
+            RetryDecision::Proceed => {}
+            other => panic!("expected Proceed after backoff expired, got {other:?}"),
+        }
+        assert_eq!(
+            *sup.current_state(),
+            SupervisorState::Stopped,
+            "expired Backoff must transition to Stopped",
+        );
+        // The reset must re-anchor `state_entered_ns` so post-reset
+        // current_uptime starts at zero (mirrors the Failed-window-expired
+        // reset path).
+        assert_eq!(
+            sup.current_uptime(),
+            Duration::ZERO,
+            "post-reset Stopped must re-anchor uptime at the reset moment",
         );
     }
 }

@@ -39,7 +39,6 @@ use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
 
 /// Name of the environment variable that lists header paths to
@@ -78,6 +77,62 @@ pub fn seed_headers_from_env() -> Vec<PathBuf> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// v0.3 Patch A: curated default seed-headers list for an Unreal Engine
+/// project root. Triggers when the project root path contains the
+/// segment `UnrealEngine` (i.e. the operator is pointing the shim at
+/// `vendor/UnrealEngine` or similar) AND `LSP_CPP_SEED_HEADERS` is
+/// unset. This is the Cropout-port surface — the headers Claude/codex
+/// queries pre-port for `AActor`, `USceneComponent`, `UPrimitiveComponent`,
+/// the gameplay statics library, sound/material asset wrappers, the
+/// data-table machinery, and the AI controller bindings.
+///
+/// Returning a curated default avoids the prior failure mode where a
+/// fresh shim against `vendor/UnrealEngine` returned `[]` for every
+/// `workspace_symbol` query because the operator forgot to set
+/// `LSP_CPP_SEED_HEADERS`, the on-disk shards hadn't loaded yet, and
+/// the in-memory index was empty. Each header parse can take a few
+/// seconds on a cold cache, so the list is intentionally short.
+pub(crate) fn ue_default_seed_headers(project_root: &Path) -> Vec<PathBuf> {
+    const UE_SEED_RELATIVES: &[&str] = &[
+        "Engine/Source/Runtime/Engine/Classes/GameFramework/Actor.h",
+        "Engine/Source/Runtime/Engine/Classes/Components/SceneComponent.h",
+        "Engine/Source/Runtime/Engine/Classes/Components/PrimitiveComponent.h",
+        "Engine/Source/Runtime/Engine/Classes/Components/ActorComponent.h",
+        "Engine/Source/Runtime/Engine/Classes/Kismet/GameplayStatics.h",
+        "Engine/Source/Runtime/Engine/Classes/Sound/SoundBase.h",
+        "Engine/Source/Runtime/Engine/Classes/Materials/MaterialInstance.h",
+        "Engine/Source/Runtime/Engine/Classes/Materials/MaterialInstanceDynamic.h",
+        "Engine/Source/Runtime/Engine/Classes/Engine/DataTable.h",
+        "Engine/Source/Runtime/Engine/Classes/Kismet/DataTableFunctionLibrary.h",
+        "Engine/Source/Runtime/AIModule/Classes/AIController.h",
+        "Engine/Source/Runtime/InputCore/Classes/InputCoreTypes.h",
+    ];
+    UE_SEED_RELATIVES
+        .iter()
+        .map(|rel| project_root.join(rel))
+        .collect()
+}
+
+/// Resolve the effective seed-headers list for a given project root.
+/// Order of precedence:
+///
+/// 1. `LSP_CPP_SEED_HEADERS` env var (verbatim absolute paths) when set
+///    and non-empty.
+/// 2. UE curated default ([`ue_default_seed_headers`]) when the project
+///    root path contains the `UnrealEngine` segment.
+/// 3. Empty list (no seeding) otherwise.
+pub(crate) fn effective_seed_headers(project_root: &Path) -> Vec<PathBuf> {
+    let from_env = seed_headers_from_env();
+    if !from_env.is_empty() {
+        return from_env;
+    }
+    let root_str = project_root.to_string_lossy();
+    if root_str.contains("UnrealEngine") {
+        return ue_default_seed_headers(project_root);
+    }
+    Vec::new()
 }
 
 /// Default request timeout. clangd can stall on a single TU for 30 s+
@@ -466,7 +521,13 @@ impl Clangd {
     /// 60 s because cold-PCH parses on UMG-class TUs can run 30 s+.
     fn request_timeout_for_method(&self, method: &str) -> u64 {
         match method {
-            "workspace/symbol" => self.request_timeout_s.min(30),
+            // v0.3 Patch A: bumped 30→90s. Cold UE-engine workspace/symbol
+            // queries against a project that hasn't yet finished the
+            // seed-didOpen TU-closure parses can take 60s+ before the
+            // in-memory symbol table is populated; the prior 30s ceiling
+            // produced spurious ClangdBusy errors on the first query
+            // even when seed-didOpen was making forward progress.
+            "workspace/symbol" => self.request_timeout_s.max(90),
             _ => self.request_timeout_s,
         }
     }
@@ -542,7 +603,10 @@ impl Clangd {
         // Clone outside the loop to release the borrow on self before
         // we call `self.notify` / `log_seed_event` (both take &mut self).
         let log_path = self.log_path.clone();
-        let headers = seed_headers_from_env();
+        // v0.3 Patch A: use effective_seed_headers so a UE project root
+        // with no LSP_CPP_SEED_HEADERS set still gets the curated
+        // Cropout-port surface seeded.
+        let headers = effective_seed_headers(&self.project_root);
         for abs in headers {
             let text = match std::fs::read_to_string(&abs) {
                 Ok(t) => t,
@@ -680,11 +744,6 @@ impl Clangd {
             &format!("[build_full_index] shards_before={shards_before}"),
         );
 
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| ShimError::Protocol("clangd stdin not initialised".into()))?;
-
         let mut tus_opened = 0usize;
         let mut skipped_io_errors = 0usize;
         let mut open_uris: Vec<String> = Vec::with_capacity(BUILD_FULL_INDEX_BATCH);
@@ -692,47 +751,62 @@ impl Clangd {
         for (batch_idx, chunk) in entries[..cap].chunks(BUILD_FULL_INDEX_BATCH).enumerate() {
             // Close the previous batch so clangd evicts the AST cache
             // while keeping the index entries already serialised.
-            for uri in open_uris.drain(..) {
-                let _ = jsonrpc::send(
-                    &mut *stdin,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "method": "textDocument/didClose",
-                        "params": { "textDocument": { "uri": uri } },
-                    }),
-                );
+            {
+                let stdin = self.stdin.as_mut().ok_or_else(|| {
+                    ShimError::Protocol("clangd stdin not initialised".into())
+                })?;
+                for uri in open_uris.drain(..) {
+                    let _ = jsonrpc::send(
+                        &mut *stdin,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "method": "textDocument/didClose",
+                            "params": { "textDocument": { "uri": uri } },
+                        }),
+                    );
+                }
+
+                for path in chunk {
+                    let text = match std::fs::read_to_string(path) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            skipped_io_errors += 1;
+                            // clangd-driver.py opens these with empty
+                            // text; we skip outright so the report's
+                            // skipped_io_errors counter is meaningful.
+                            continue;
+                        }
+                    };
+                    let uri = format!("file://{path}");
+                    jsonrpc::send(
+                        &mut *stdin,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "method": "textDocument/didOpen",
+                            "params": {
+                                "textDocument": {
+                                    "uri": uri,
+                                    "languageId": "cpp",
+                                    "version": 1,
+                                    "text": text,
+                                }
+                            },
+                        }),
+                    )?;
+                    open_uris.push(uri);
+                    tus_opened += 1;
+                }
             }
 
-            for path in chunk {
-                let text = match std::fs::read_to_string(path) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        skipped_io_errors += 1;
-                        // clangd-driver.py opens these with empty text;
-                        // we skip outright so the report's
-                        // skipped_io_errors counter is meaningful.
-                        continue;
-                    }
-                };
-                let uri = format!("file://{path}");
-                jsonrpc::send(
-                    &mut *stdin,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "method": "textDocument/didOpen",
-                        "params": {
-                            "textDocument": {
-                                "uri": uri,
-                                "languageId": "cpp",
-                                "version": 1,
-                                "text": text,
-                            }
-                        },
-                    }),
-                )?;
-                open_uris.push(uri);
-                tus_opened += 1;
-            }
+            // v0.3 lifetime fix: drain pending stdout notifications
+            // INLINE between batches so clangd's stdout pipe buffer
+            // never fills (which would deadlock our next stdin write
+            // because clangd would block on its stdout-write before
+            // reading more stdin). Replaces the prior thread::spawn +
+            // self.stdout.take() pattern that left the reader thread
+            // owning stdout and forced a SIGKILL of clangd at the end
+            // of every build_full_index call.
+            drain_pending_stdout(self.stdout.as_mut());
 
             log_line(
                 &self.log_path,
@@ -747,55 +821,34 @@ impl Clangd {
         }
 
         // Close the final batch.
-        for uri in open_uris.drain(..) {
-            let _ = jsonrpc::send(
-                &mut *stdin,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "method": "textDocument/didClose",
-                    "params": { "textDocument": { "uri": uri } },
-                }),
-            );
+        {
+            let stdin = self
+                .stdin
+                .as_mut()
+                .ok_or_else(|| ShimError::Protocol("clangd stdin not initialised".into()))?;
+            for uri in open_uris.drain(..) {
+                let _ = jsonrpc::send(
+                    &mut *stdin,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "method": "textDocument/didClose",
+                        "params": { "textDocument": { "uri": uri } },
+                    }),
+                );
+            }
         }
 
-        // Drain stdout in a worker thread so we don't deadlock against
-        // clangd if its stdout buffer fills with notifications. We do
-        // not parse the JSON-RPC content; we only need to keep the
-        // pipe drained while we wait for shards to settle on disk.
-        // Returning the JoinHandle is unnecessary — the thread exits
-        // when clangd's stdout is closed at shutdown.
-        if let Some(stdout) = self.stdout.take() {
-            thread::spawn(move || {
-                let mut stdout = stdout;
-                loop {
-                    match jsonrpc::recv(&mut stdout) {
-                        Ok(_msg) => {
-                            // Optional: inspect for $/progress with
-                            // value.kind == "end" on the
-                            // backgroundIndexProgress token, which
-                            // clangd emits when the queue drains. We
-                            // do not gate quiescence on this signal
-                            // because shard-count quiescence is the
-                            // ground truth callers consume; we just
-                            // keep the pipe drained so a full stdout
-                            // buffer doesn't deadlock clangd.
-                        }
-                        Err(_e) => {
-                            // EOF or framing error — clangd closed.
-                            return;
-                        }
-                    }
-                }
-            });
-        }
-
-        // Shard-count quiescence drain.
+        // Shard-count quiescence drain. Each iteration also drains any
+        // stdout notifications clangd emitted since the last iteration
+        // (mostly $/progress on the backgroundIndex token) so the
+        // stdout pipe buffer does not fill while we sleep.
         let drain_started = Instant::now();
         let mut last_count = count_shards(&index_dir);
         let mut last_change = Instant::now();
         let mut cap_fired = false;
         loop {
             std::thread::sleep(Duration::from_secs(2));
+            drain_pending_stdout(self.stdout.as_mut());
             let now_count = count_shards(&index_dir);
             if now_count != last_count {
                 last_change = Instant::now();
@@ -852,36 +905,83 @@ impl Clangd {
                 serde_json::to_string(&report).unwrap_or_default()
             ),
         );
-        // Clean up the clangd subprocess so the detached reader
-        // thread (which owns `self.stdout` since the `take()` above)
-        // unblocks on EOF and exits. Without this, every
-        // build_full_index call would leak one reader thread until
-        // process exit. We can't go through the normal `shutdown`
-        // path here because that path expects `self.stdout` to still
-        // be live for the response to its `shutdown` request; the
-        // reader thread owns it now. Just send `exit` (clangd treats
-        // it as immediate-exit) + drop stdin + reap the child.
-        let _ = self.notify("exit", Value::Null);
-        if let Some(stdin) = self.stdin.take() {
-            drop(stdin);
-        }
-        if let Some(mut child) = self.child.take() {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) if Instant::now() > deadline => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
-                    }
-                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                    Err(_) => break,
-                }
-            }
-        }
+        // v0.3 lifetime fix: do NOT shut down clangd here. The prior
+        // implementation sent `exit` + dropped stdin + SIGKILLed the
+        // child to make a detached reader thread (which had taken
+        // ownership of self.stdout) unblock. Inline drain replaces the
+        // detached thread, so stdout is still owned by self and
+        // clangd stays alive for subsequent workspace_symbol /
+        // definition / hover queries — which is the whole point of
+        // pre-warming the index. The matching integration test
+        // (build_full_index_preserves_child) asserts the PID is
+        // unchanged across this call.
         Ok(report)
     }
+}
+
+/// Drain any pending notifications on clangd's stdout pipe without
+/// blocking. Called by [`Clangd::build_full_index`] between batches and
+/// during the shard-quiescence drain so a slow consumer of stdout
+/// (this process, while it is sleeping or feeding the next batch)
+/// never lets clangd block on a full stdout pipe.
+///
+/// Strategy: use `libc::poll` with a 0 ms timeout against the raw fd
+/// underlying the `BufReader<ChildStdout>`. When the fd reports
+/// `POLLIN`, parse one frame via [`jsonrpc::recv`] and discard the
+/// content. Repeat until poll says no data is available.
+///
+/// **`BufReader` interaction.** `BufReader` has its own internal byte
+/// buffer; if a previous `recv` left bytes in the buffer they will be
+/// served by the next `recv` without a syscall, but `poll` operates on
+/// the underlying fd and won't see those bytes. We therefore
+/// short-circuit when `BufReader::buffer()` is non-empty: parse from
+/// the buffer first, then fall through to `poll` for fresh data.
+///
+/// All errors are swallowed — drain is best-effort. A framing error
+/// or EOF indicates clangd has closed, which the next request through
+/// `Clangd::request` will surface as a structured `ClangdExited` via
+/// the existing `is_alive()` probe.
+fn drain_pending_stdout(stdout: Option<&mut BufReader<ChildStdout>>) {
+    use std::os::unix::io::AsRawFd;
+    let stdout = match stdout {
+        Some(s) => s,
+        None => return,
+    };
+    // Bound iterations to keep this from running forever if clangd is
+    // emitting notifications faster than we can drain (very unlikely
+    // in practice — $/progress messages are throttled by clangd).
+    for _ in 0..1024 {
+        let buf_has_data = !stdout.buffer().is_empty();
+        let fd_ready = if buf_has_data {
+            true
+        } else {
+            poll_fd_ready(stdout.get_ref().as_raw_fd(), 0)
+        };
+        if !fd_ready {
+            return;
+        }
+        match jsonrpc::recv(&mut *stdout) {
+            Ok(_msg) => continue,
+            Err(_) => return,
+        }
+    }
+}
+
+/// Non-blocking readiness check on a raw fd. Returns `true` if the fd
+/// is currently readable (`POLLIN`), `false` if the timeout expires
+/// without data or `poll` itself errored. Wraps the libc `poll` syscall
+/// directly to avoid pulling in a heavier async runtime; the surface
+/// here is small enough that the unsafe block is contained.
+fn poll_fd_ready(fd: std::os::unix::io::RawFd, timeout_ms: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: pfd is a valid &mut to a single pollfd; nfds=1 matches.
+    // libc::poll is a thin syscall wrapper and is async-signal-safe.
+    let rc = unsafe { libc::poll(&mut pfd as *mut _, 1, timeout_ms) };
+    rc > 0 && (pfd.revents & libc::POLLIN) != 0
 }
 
 /// Pick the compile-commands JSON path. Prefers the full DB so the
@@ -1660,12 +1760,15 @@ mod tests {
         );
     }
 
-    /// Per-method timeout selector: workspace/symbol gets a tighter
-    /// 30 s ceiling; position queries inherit the configured 60 s.
+    /// Per-method timeout selector: workspace/symbol gets a 90 s floor
+    /// (v0.3 Patch A bumped from 30 s) because cold UE-engine queries
+    /// against a project that hasn't yet finished its seed-didOpen TU
+    /// closure parses can run 60 s+ before the in-memory symbol table
+    /// is populated; position queries inherit the configured 60 s.
     /// Deleting the `match` arm in `request_timeout_for_method` makes
     /// this test fail.
     #[test]
-    fn workspace_symbol_uses_tighter_timeout_than_position_queries() {
+    fn workspace_symbol_uses_longer_timeout_than_position_queries() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("compile_commands.json"), b"[]").unwrap();
         let backend = Clangd::new(dir.path());
@@ -1681,8 +1784,8 @@ mod tests {
         assert_eq!(backend.request_timeout_for_method("textDocument/hover"), 60);
         assert_eq!(
             backend.request_timeout_for_method("workspace/symbol"),
-            30,
-            "workspace/symbol should clamp to 30s ceiling"
+            90,
+            "v0.3 Patch A: workspace/symbol uses 90s floor"
         );
     }
 

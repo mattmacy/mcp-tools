@@ -185,17 +185,18 @@ fn replay_event_stream_fixture_exposes_usage_axes() {
         .join("tests/fixtures/replay/exec-event-stream.jsonl");
     std::env::set_var("CODEX_STDIO_REPLAY_FIXTURE", &fixture);
 
-    // Override the worktree-root prefix so the test can use a path
-    // under the cargo target dir without depending on `/tmp/wtpool/`
-    // existing on the host.
-    let target_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
-    let mut prefix = target_dir.display().to_string();
+    // Override the worktree-root prefix so the test can use an
+    // isolated tempdir rather than a subdir of this crate's own dirty
+    // checkout. Manufacture-refusal now treats repo-root dirt as a
+    // hard error, which is correct for real worker repos.
+    let tmp_root = tempfile::tempdir().unwrap();
+    let mut prefix = tmp_root.path().display().to_string();
     if !prefix.ends_with('/') {
         prefix.push('/');
     }
     std::env::set_var("CODEX_STDIO_WORKTREE_ROOT", &prefix);
 
-    let worktree_path = target_dir.join("replay-event-stream-worktree");
+    let worktree_path = tmp_root.path().join("replay-event-stream-worktree");
     std::fs::create_dir_all(&worktree_path).unwrap();
     let line = format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":45,\"method\":\"tools/call\",\"params\":{{\"name\":\"codex_run_task\",\"arguments\":{{\"task_packet\":\"fix the off-by-one in validate_token\",\"worktree_path\":\"{}\"}}}}}}\n",

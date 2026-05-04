@@ -142,7 +142,7 @@ pub fn tools_list_result() -> Value {
                         },
                         "max_tokens": {
                             "type": "integer",
-                            "description": "Output ceiling (max_completion_tokens). Default 16384."
+                            "description": "Output ceiling (max_completion_tokens). Default 131072."
                         },
                         "model": {
                             "type": "string",

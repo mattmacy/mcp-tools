@@ -11,7 +11,7 @@
 //!   [`crate::WORKTREE_ROOT_PREFIX`] via canonicalize so symlink
 //!   escapes fail closed.
 //! - `max_tokens` (integer, optional) — output ceiling. Defaults to
-//!   16384 (OpenAI's pre-`max_completion_tokens` historical default).
+//!   131072 (bumped 2026-05-03 from 16384 to give multi-native impl batches headroom).
 //! - `model` (string, optional) — overrides
 //!   [`crate::DEFAULT_MODEL`]. Allows the routing skill to pick
 //!   `gpt-5.5` or `gpt-5.5-pro` for outcome-A-impl shapes while
@@ -42,7 +42,7 @@ fn worktree_root_prefix() -> String {
 }
 
 /// Default output ceiling when the caller omits `max_tokens`.
-pub(crate) const DEFAULT_MAX_TOKENS: u64 = 16_384;
+pub(crate) const DEFAULT_MAX_TOKENS: u64 = 131_072;
 
 /// Parsed + validated arguments to [`run`]. Intra-crate-only; the
 /// integration tests drive the public MCP surface
@@ -200,59 +200,8 @@ pub(crate) fn dispatch(args: &Args, client: &dyn Client) -> Result<Value, String
     // until the upstream `usage` block surfaces them. Keeping the
     // axes out of `tokens_used` means the routing skill's existing
     // cost ledger does not need to be re-keyed.
-    // Defer to codex's own commit when present. Codex agent mode under
-    // CODEX_STDIO_SANDBOX_BYPASS=1 can run `git commit` in its bash sandbox
-    // when the spec asks it to; if it did, the worktree HEAD has moved off
-    // pre_sha. In that case the shim trusts codex's commit verbatim and
-    // skips the manufacture path entirely. The manufacture path
-    // (build_commit_subject) is brittle — it has produced a Rule-10
-    // regression class for every model-response shape it encounters
-    // (rows 37 and trial-2 surface separate skip-list misses). Asking
-    // codex to self-commit sidesteps the line-picker entirely.
-    //
-    // The manufacture path remains the fallback for the case where codex
-    // emitted edits but did NOT commit (older specs, or the model
-    // declined to run git for whatever reason).
-    let post_sha = git_rev_parse_head(&args.worktree_path).ok();
-    let codex_committed = match (pre_sha.as_deref(), post_sha.as_deref()) {
-        (Some(pre), Some(post)) => pre != post,
-        _ => false,
-    };
-    let (commit_sha, committed_by) = if codex_committed {
-        (post_sha.clone(), "codex")
-    } else {
-        match git_status_porcelain(&args.worktree_path) {
-            Ok(porcelain) if !porcelain.trim().is_empty() => {
-                let subject = build_commit_subject(&model_text, &resp.model);
-                let body = if has_narrative_content(&model_text) {
-                    model_text.clone()
-                } else {
-                    format!(
-                        "Auto-commit by codex-stdio shim. Model returned diff-only response (no narrative paragraph). See diff-stat below.\n\nmodel={}\nresponse_id={}\nfiles_changed={}",
-                        resp.model,
-                        resp.id,
-                        model_text
-                            .lines()
-                            .filter(|line| line.starts_with("+++ "))
-                            .count(),
-                    )
-                };
-                let sha = match git_commit_worktree(&args.worktree_path, &subject, &body) {
-                    Ok(sha) => Some(sha),
-                    Err(e) => {
-                        log::warn!(
-                            "[codex-stdio] auto-commit failed in {}: {}",
-                            args.worktree_path.display(),
-                            e
-                        );
-                        None
-                    }
-                };
-                (sha, "shim")
-            }
-            _ => (None, "none"),
-        }
-    };
+    let (commit_sha, committed_by) =
+        decide_commit_outcome(pre_sha.as_deref(), &args.worktree_path)?;
     Ok(json!({
         "diff": diff,
         "commit_sha": commit_sha,
@@ -437,103 +386,31 @@ pub(crate) fn git_status_porcelain(worktree: &std::path::Path) -> Result<String,
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Build a commit subject from the model's narrative response. Picks
-/// the first non-blank line that is not a code-fence delimiter,
-/// trims, truncates to 72 chars. Falls back to a generated subject
-/// when the model emitted only fences / blanks.
-pub(crate) fn build_commit_subject(model_text: &str, model_id: &str) -> String {
-    let mut in_code_fence = false;
-    for line in model_text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            in_code_fence = !in_code_fence;
-            continue;
-        }
-        if in_code_fence || should_skip_commit_message_line(trimmed) {
-            continue;
-        }
-        let cleaned = trimmed.trim_start_matches('#').trim();
-        if cleaned.is_empty() {
-            continue;
-        }
-        return cleaned.chars().take(72).collect();
-    }
-    format!("codex run-task: {model_id} dispatch")
-}
-
-/// Returns true if `model_text` contains any non-diff narrative line.
-/// Used to avoid committing the raw diff as the commit body when the
-/// model responded with a diff only.
-pub(crate) fn has_narrative_content(model_text: &str) -> bool {
-    let mut in_code_fence = false;
-    for line in model_text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            in_code_fence = !in_code_fence;
-            continue;
-        }
-        if in_code_fence || should_skip_commit_message_line(trimmed) {
-            continue;
-        }
-        return true;
-    }
-    false
-}
-
-fn should_skip_commit_message_line(trimmed: &str) -> bool {
-    trimmed.is_empty()
-        || trimmed.starts_with("```")
-        || trimmed.starts_with("diff --git")
-        || trimmed.starts_with("--- ")
-        || trimmed.starts_with("+++ ")
-        || trimmed.starts_with("@@ ")
-        || trimmed.starts_with("index ")
-        || trimmed.starts_with("new file mode")
-        || trimmed.starts_with("deleted file mode")
-        || trimmed.starts_with("Binary files")
-        || trimmed.starts_with("Ok(")
-        || trimmed.starts_with("Err(")
-        || trimmed.starts_with("Some(")
-        || trimmed.starts_with("None,")
-        || trimmed == "None"
-        || trimmed.starts_with('+')
-        || trimmed.starts_with('-')
-}
-
-/// `git add -A && git commit -m <subject> -m <body>` in worktree.
-/// Returns the new HEAD sha on success.
-pub(crate) fn git_commit_worktree(
+/// Decide whether codex committed, did nothing, or left an error state.
+///
+/// Returns `(Some(sha), "codex")` when HEAD moved, `(None, "none")`
+/// when the worktree is clean, and `Err(...)` when codex dirtied the
+/// worktree without committing.
+pub fn decide_commit_outcome(
+    pre_sha: Option<&str>,
     worktree: &std::path::Path,
-    subject: &str,
-    body: &str,
-) -> Result<String, String> {
-    let add = std::process::Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["add", "-A"])
-        .output()
-        .map_err(|e| format!("spawn git add: {e}"))?;
-    if !add.status.success() {
-        return Err(format!(
-            "git add -A failed in `{}`: {}",
-            worktree.display(),
-            String::from_utf8_lossy(&add.stderr).trim(),
-        ));
+) -> Result<(Option<String>, &'static str), String> {
+    let post_sha = git_rev_parse_head(worktree).ok();
+    let codex_committed = match (pre_sha, post_sha.as_deref()) {
+        (Some(pre), Some(post)) => pre != post,
+        _ => false,
+    };
+    if codex_committed {
+        return Ok((post_sha, "codex"));
     }
-    let commit = std::process::Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["commit", "-m", subject, "-m", body])
-        .output()
-        .map_err(|e| format!("spawn git commit: {e}"))?;
-    if !commit.status.success() {
-        return Err(format!(
-            "git commit failed in `{}`: {}",
-            worktree.display(),
-            String::from_utf8_lossy(&commit.stderr).trim(),
-        ));
+    match git_status_porcelain(worktree) {
+        Ok(porcelain) if !porcelain.trim().is_empty() => Err(format!(
+            "codex-stdio: codex left {} dirty files but did not commit. The shim's manufacture-commit fallback is REFUSED (per feedback_shim_only_commits_when_codex_doesnt structural fix). The orchestrator must instruct codex to run `git add -A && git commit -m <subject>` using the spec's 'Commit message template' section. Files dirty: {}",
+            porcelain.lines().count(),
+            porcelain.lines().take(5).collect::<Vec<_>>().join(" | "),
+        )),
+        _ => Ok((None, "none")),
     }
-    git_rev_parse_head(worktree)
 }
 
 fn log_pre_sha_snapshot_failed(worktree: &std::path::Path, reason: &str) {
@@ -974,130 +851,6 @@ mod tests {
             "diff should start with header: {diff:?}",
         );
         assert!(diff.contains("+after"), "diff should show added line");
-    }
-
-    #[test]
-    fn test_build_commit_subject_picks_first_nonblank_line() {
-        let subject = build_commit_subject("First line is the subject\n\nMore detail here", "gpt");
-        assert_eq!(subject, "First line is the subject");
-    }
-
-    #[test]
-    fn test_build_commit_subject_skips_code_fences() {
-        let subject = build_commit_subject("```rust\nfn foo() {}\n```\nReal subject", "gpt");
-        assert_eq!(subject, "Real subject");
-    }
-
-    #[test]
-    fn test_build_commit_subject_skips_diff_git_line() {
-        let input = "diff --git a/foo b/foo\n--- a/foo\n+++ b/foo\n+content\nReal subject here";
-        let subject = build_commit_subject(input, "gpt");
-        assert_eq!(subject, "Real subject here");
-    }
-
-    #[test]
-    fn test_build_commit_subject_skips_diff_body_lines() {
-        let input = "+added line\n-removed line\n@@ -1,2 +3,4 @@\nActual subject";
-        let subject = build_commit_subject(input, "gpt");
-        assert_eq!(subject, "Actual subject");
-    }
-
-    #[test]
-    fn test_build_commit_subject_truncates_at_72() {
-        let input = "a".repeat(100);
-        let subject = build_commit_subject(&input, "gpt");
-        assert_eq!(subject.len(), 72);
-        assert!(subject.chars().all(|c| c == 'a'));
-    }
-
-    #[test]
-    fn test_build_commit_subject_fallback_on_only_fences() {
-        let subject = build_commit_subject("```\n```\n", "gpt-5.4");
-        assert_eq!(subject, "codex run-task: gpt-5.4 dispatch");
-    }
-
-    #[test]
-    fn test_build_commit_subject_skips_bare_ok_expression() {
-        let input = "Ok(RuntimeValue::None)\n\nReal narrative line";
-        let subject = build_commit_subject(input, "gpt");
-        assert_eq!(subject, "Real narrative line");
-    }
-
-    #[test]
-    fn test_build_commit_subject_skips_bare_err_expression() {
-        let input = "Err(VmError::TypeMismatch)\nNarrative explanation";
-        let subject = build_commit_subject(input, "gpt");
-        assert_eq!(subject, "Narrative explanation");
-    }
-
-    #[test]
-    fn test_build_commit_subject_skips_bare_some_and_none() {
-        let input = "Some(value)\nNone\nReal subject";
-        let subject = build_commit_subject(input, "gpt");
-        assert_eq!(subject, "Real subject");
-    }
-
-    #[test]
-    fn test_build_commit_subject_keeps_prose_starting_with_ok_word() {
-        let input = "Ok so we ported the function\nMore detail";
-        let subject = build_commit_subject(input, "gpt");
-        assert_eq!(subject, "Ok so we ported the function");
-    }
-
-    #[test]
-    fn test_has_narrative_content_pure_diff_returns_false() {
-        let input = "diff --git a/foo b/foo\n--- a/foo\n+++ b/foo\n@@ -1 +1 @@\n-old\n+new\n";
-        assert!(!has_narrative_content(input));
-    }
-
-    #[test]
-    fn test_has_narrative_content_with_paragraph_returns_true() {
-        let input =
-            "diff --git a/foo b/foo\n--- a/foo\n+++ b/foo\n+content\nThis is the narrative.";
-        assert!(has_narrative_content(input));
-    }
-
-    #[test]
-    fn test_git_commit_worktree_round_trip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let wt = tmp.path();
-        let init = std::process::Command::new("git")
-            .arg("-C")
-            .arg(wt)
-            .args(["init", "-q", "-b", "main"])
-            .status()
-            .unwrap();
-        assert!(init.success());
-        for kv in [
-            ("user.email", "test@local"),
-            ("user.name", "test"),
-            ("commit.gpgsign", "false"),
-        ] {
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(wt)
-                .args(["config", kv.0, kv.1])
-                .status()
-                .unwrap();
-        }
-        let f = wt.join("hello.txt");
-        std::fs::write(&f, "hello\n").unwrap();
-
-        let body = "Commit body line one\n\nCommit body line two";
-        let sha = git_commit_worktree(wt, "subject line", body).expect("git commit");
-        let head = git_rev_parse_head(wt).expect("rev-parse HEAD");
-        assert_eq!(sha, head);
-
-        let log = std::process::Command::new("git")
-            .arg("-C")
-            .arg(wt)
-            .args(["log", "-1", "--format=%s%n%b"])
-            .output()
-            .unwrap();
-        assert!(log.status.success());
-        let log_text = String::from_utf8_lossy(&log.stdout);
-        assert!(log_text.contains("subject line"), "got {log_text:?}");
-        assert!(log_text.contains(body), "got {log_text:?}");
     }
 
     /// Mutation-equivalent: if [`git_rev_parse_head`] silently swallowed
