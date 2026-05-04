@@ -828,6 +828,7 @@ fn error_kind(e: &ShimError) -> &'static str {
         ShimError::NoCompileCommands { .. } => "no_compile_commands",
         ShimError::NoIndexFile { .. } => "no_index_file",
         ShimError::InitializeTimeout { .. } => "initialize_timeout",
+        ShimError::WarmupTimeout { .. } => "warmup_timeout",
         ShimError::RequestTimeout { .. } => "request_timeout",
         ShimError::ClangdBusy { .. } => "clangd_busy",
         ShimError::QueueDepthExceeded { .. } => "queue_depth_exceeded",

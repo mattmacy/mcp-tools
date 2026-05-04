@@ -271,6 +271,7 @@ fn error_kind(e: &ShimError) -> &'static str {
         ShimError::NoCompileCommands { .. } => "no_compile_commands",
         ShimError::NoIndexFile { .. } => "no_index_file",
         ShimError::InitializeTimeout { .. } => "initialize_timeout",
+        ShimError::WarmupTimeout { .. } => "warmup_timeout",
         ShimError::RequestTimeout { .. } => "request_timeout",
         ShimError::ClangdBusy { .. } => "clangd_busy",
         ShimError::QueueDepthExceeded { .. } => "queue_depth_exceeded",
@@ -286,7 +287,23 @@ fn default_index_file() -> String {
     format!("{home}/.cache/lsp-cpp-full-index/index.idx")
 }
 
-fn run_serve_mcp(backend: Clangd) -> Result<(), ShimError> {
+fn run_serve_mcp(mut backend: Clangd) -> Result<(), ShimError> {
+    // Eager spawn: bring clangd up + run the warm-up gate before the
+    // MCP loop accepts requests. Prior behaviour was lazy spawn on
+    // first dispatch, which paid spawn + initialize + seed-didOpen
+    // cost on the caller's first `workspace_symbol` and returned `[]`
+    // because seed-didOpen TUs hadn't finished parsing yet.
+    //
+    // `Clangd::spawn()` runs `seed_didopen()` followed by
+    // `wait_for_warm()` (clangd.rs); a successful return here means
+    // the symbol DB has a non-empty response for the curated probe
+    // symbol and subsequent dispatches are queryable on the first
+    // request. A `ShimError::WarmupTimeout` here is fatal for
+    // serve-mcp — a half-warm clangd is worse than a hard failure
+    // because it lies silently. The MCP transport receives the
+    // non-zero exit and the host (CC) can alarm.
+    use lsp_cpp::backend::LspBackend;
+    backend.spawn()?;
     // Owned backend hands off to the MCP loop, which holds it for the
     // lifetime of the stdio session (one long-lived clangd subprocess
     // per MCP session — see mcp.rs module docstring).

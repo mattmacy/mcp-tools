@@ -53,6 +53,31 @@ pub enum ShimError {
         log_path: String,
     },
 
+    /// Post-`initialize` warm-up gate timed out: seed-didOpen
+    /// notifications were sent but `workspace/symbol` against the
+    /// known-seeded probe symbol still returned `[]` after
+    /// `timeout_s`. Distinct from `InitializeTimeout` (clangd never
+    /// completed handshake) and `RequestTimeout` (single request
+    /// stalled on a live clangd).
+    ///
+    /// Emitted from `Clangd::spawn()` after `seed_didopen()` so
+    /// `serve_stdio` callers don't hand out a half-warm clangd that
+    /// returns empty symbol lists for several seconds-to-minutes
+    /// while shards parse. Set `LSP_CPP_WARMUP_TIMEOUT_S` to override
+    /// the default (60s); set `LSP_CPP_WARMUP_DISABLE=1` to skip the
+    /// gate entirely (legacy lazy behaviour).
+    #[error(
+        "clangd warm-up gate timed out after {timeout_s}s; probe={probe} returned []; clangd log {log_path}"
+    )]
+    WarmupTimeout {
+        /// Probe symbol queried (typically a seeded UE class name).
+        probe: String,
+        /// Configured warm-up timeout in seconds.
+        timeout_s: u64,
+        /// Path to the clangd stderr log for post-mortem.
+        log_path: String,
+    },
+
     /// A request that previously succeeded against the same clangd
     /// instance now returns no response. Distinct from
     /// `InitializeTimeout` because the indexer might still be alive but

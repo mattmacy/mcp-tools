@@ -144,6 +144,30 @@ const DEFAULT_REQUEST_TIMEOUT_S: u64 = 60;
 /// 10 s is generous.
 const DEFAULT_INITIALIZE_TIMEOUT_S: u64 = 10;
 
+/// Default warm-up gate timeout. After `seed_didopen` sends header
+/// `textDocument/didOpen` notifications, `wait_for_warm` polls
+/// `workspace/symbol(<probe>)` until it returns at least one match
+/// or this many seconds elapse. 60s covers cold-cache parses for the
+/// curated UE seed-headers list; override via
+/// [`WARMUP_TIMEOUT_ENV`].
+const DEFAULT_WARMUP_TIMEOUT_S: u64 = 60;
+
+/// Probe symbol used by `wait_for_warm` to decide clangd's symbol DB
+/// is queryable. `AActor` is in `ue_default_seed_headers` (Actor.h)
+/// and is also exported by the curated UE seed list, so a non-empty
+/// response proves at least one TU has been parsed end-to-end.
+const WARMUP_PROBE_SYMBOL: &str = "AActor";
+
+/// Env var to override the warm-up gate timeout in seconds.
+pub const WARMUP_TIMEOUT_ENV: &str = "LSP_CPP_WARMUP_TIMEOUT_S";
+
+/// Env var to skip the warm-up gate entirely (any non-empty value
+/// disables). Use only as a debugging escape hatch — leaving the
+/// gate disabled returns the prior failure mode where the first
+/// `workspace_symbol` call returns `[]` while clangd is still
+/// parsing seeded TUs.
+pub const WARMUP_DISABLE_ENV: &str = "LSP_CPP_WARMUP_DISABLE";
+
 /// Indexing mode for the backing clangd instance.
 ///
 /// clangd has two index sources: the live `--background-index` worker
@@ -645,6 +669,88 @@ impl Clangd {
                     ),
                 ),
             }
+        }
+    }
+
+    /// Block until clangd's symbol DB is non-empty for the curated
+    /// probe symbol, or until the warm-up timeout elapses.
+    ///
+    /// Called by `spawn()` after `seed_didopen()` so callers never
+    /// receive a half-warm clangd that returns `[]` on the first
+    /// `workspace/symbol` query. Polls every 250ms; bounded by
+    /// `LSP_CPP_WARMUP_TIMEOUT_S` (default
+    /// [`DEFAULT_WARMUP_TIMEOUT_S`]) or skipped entirely when
+    /// [`WARMUP_DISABLE_ENV`] is set to any non-empty value.
+    ///
+    /// Probe symbol is [`WARMUP_PROBE_SYMBOL`] (`AActor`), which is
+    /// in the curated UE seed-headers list so a successful seed
+    /// guarantees a non-empty response. For non-UE projects with no
+    /// seeded headers, the gate would block until the timeout —
+    /// such projects should set [`WARMUP_DISABLE_ENV`] to opt out.
+    ///
+    /// Returns [`ShimError::WarmupTimeout`] on timeout. The clangd
+    /// subprocess is left alive so the caller can report the failure
+    /// without losing pending shard-parse progress.
+    fn wait_for_warm(&mut self) -> Result<()> {
+        if std::env::var(WARMUP_DISABLE_ENV)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            log_seed_event(
+                &self.log_path,
+                "lsp-cpp warm-up gate: disabled via LSP_CPP_WARMUP_DISABLE",
+            );
+            return Ok(());
+        }
+        // For non-UE projects with no curated seed list, wait_for_warm
+        // would block until timeout because no header was opened. Skip
+        // when effective_seed_headers is empty.
+        if effective_seed_headers(&self.project_root).is_empty() {
+            log_seed_event(
+                &self.log_path,
+                "lsp-cpp warm-up gate: no seed-headers for project root; skipping",
+            );
+            return Ok(());
+        }
+        let timeout_s = std::env::var(WARMUP_TIMEOUT_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_WARMUP_TIMEOUT_S);
+        let deadline = Instant::now() + Duration::from_secs(timeout_s);
+        let log_path_buf = self.log_path.clone();
+        let log_path = self.log_path.display().to_string();
+        loop {
+            match self.workspace_symbol(WARMUP_PROBE_SYMBOL) {
+                Ok(syms) if !syms.is_empty() => {
+                    log_seed_event(
+                        &log_path_buf,
+                        &format!(
+                            "lsp-cpp warm-up gate: probe {} returned {} symbols",
+                            WARMUP_PROBE_SYMBOL,
+                            syms.len()
+                        ),
+                    );
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    log_seed_event(
+                        &log_path_buf,
+                        &format!(
+                            "lsp-cpp warm-up gate: probe error {} (continuing)",
+                            e
+                        ),
+                    );
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(ShimError::WarmupTimeout {
+                    probe: WARMUP_PROBE_SYMBOL.to_string(),
+                    timeout_s,
+                    log_path,
+                });
+            }
+            std::thread::sleep(Duration::from_millis(250));
         }
     }
 
@@ -1244,6 +1350,7 @@ impl LspBackend for Clangd {
         // land on disk). Default empty — when unset this is a no-op.
         // Best-effort per file — never fails spawn.
         self.seed_didopen();
+        self.wait_for_warm()?;
         Ok(())
     }
 
