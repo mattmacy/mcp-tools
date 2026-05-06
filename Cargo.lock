@@ -960,6 +960,7 @@ dependencies = [
  "clap",
  "fs2",
  "git2",
+ "lsp-shim-core",
  "serde",
  "serde_json",
  "tempfile",

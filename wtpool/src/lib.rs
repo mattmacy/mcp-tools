@@ -23,6 +23,8 @@
 
 pub mod agents;
 pub mod cache;
+/// Compatibility helpers for legacy environment variable names.
+pub mod compat;
 pub mod cumulative_md;
 pub mod git;
 pub mod git_exec;

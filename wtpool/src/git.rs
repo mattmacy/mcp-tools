@@ -26,6 +26,8 @@ use std::path::{Path, PathBuf};
 use git2::{Repository, StatusOptions};
 use serde_json::{json, Value};
 
+use crate::compat::repo_root_env;
+
 /// Number of recent log lines to embed in `worktree_state.last_log_lines`.
 /// Five is enough for a reviewer to recognise a branch's recent work
 /// without bloating the MCP payload — same heuristic the existing
@@ -301,7 +303,12 @@ pub fn validate_worktree_path(p: &str) -> Result<PathBuf, String> {
 
 /// Resolve the allowed-root list at call time from
 /// `WTPOOL_ALLOWED_ROOTS` (colon-separated). Falls back to `/tmp` plus
-/// [`crate::DEFAULT_REPO`].
+/// the runtime-resolved repo root from `WTPOOL_REPO` (or
+/// [`crate::DEFAULT_REPO`] when `WTPOOL_REPO` is also unset).
+///
+/// Pre-2026-05-03 this fell back to a literal `/tmp:/repo` regardless
+/// of the sibling `WTPOOL_REPO` override. The allow-list now follows
+/// the repo override so a single env var configures both.
 fn allowed_root_prefixes() -> Vec<String> {
     if let Ok(v) = std::env::var("WTPOOL_ALLOWED_ROOTS") {
         let v = v.trim();
@@ -313,7 +320,11 @@ fn allowed_root_prefixes() -> Vec<String> {
                 .collect();
         }
     }
-    vec!["/tmp".to_string(), crate::DEFAULT_REPO.to_string()]
+    let repo_root = repo_root_env()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| crate::DEFAULT_REPO.to_string());
+    vec!["/tmp".to_string(), repo_root]
 }
 
 #[cfg(test)]

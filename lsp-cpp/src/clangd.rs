@@ -31,6 +31,7 @@
 //! both consumers agree on which TUs are in scope.
 
 use crate::backend::{Hover, Location, LspBackend, Symbol};
+use crate::compat::{index_file_env, index_mode_env};
 use crate::error::{Result, ShimError};
 use crate::jsonrpc;
 use serde::{Deserialize, Serialize};
@@ -219,14 +220,12 @@ impl IndexMode {
     /// `full` and `hybrid` honour `LSP_CPP_INDEX_FILE` for the
     /// path; default is `$HOME/.cache/lsp-cpp-full-index/index.idx`.
     pub fn from_env() -> Self {
-        let mode = std::env::var("LSP_CPP_INDEX_MODE").unwrap_or_default();
+        let mode = index_mode_env().unwrap_or_default();
         let index_file = || -> PathBuf {
-            std::env::var("LSP_CPP_INDEX_FILE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-                    PathBuf::from(home).join(".cache/lsp-cpp-full-index/index.idx")
-                })
+            index_file_env().map(PathBuf::from).unwrap_or_else(|| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+                PathBuf::from(home).join(".cache/lsp-cpp-full-index/index.idx")
+            })
         };
         match mode.as_str() {
             "full" => IndexMode::Full {
@@ -744,11 +743,24 @@ impl Clangd {
                 }
             }
             if Instant::now() >= deadline {
-                return Err(ShimError::WarmupTimeout {
-                    probe: WARMUP_PROBE_SYMBOL.to_string(),
-                    timeout_s,
-                    log_path,
-                });
+                // Soft-degrade: log + continue with not-fully-warm clangd.
+                // Hard-fail on warm-up alone is worse than slow first
+                // queries — fatal-exit triggers CC's MCP reconnect loop,
+                // which re-runs eager spawn from cold, hits the same
+                // timeout, exhausts CC's respawn budget, and leaves the
+                // MCP transport dead with empty cached results. The
+                // 2026-05-04 incident proved this. clangd is alive +
+                // background-indexing; subsequent RPCs land queries that
+                // clangd serves as parses complete. Status RPC surfaces
+                // warmup_state so the operator can observe.
+                log_seed_event(
+                    &log_path_buf,
+                    &format!(
+                        "lsp-cpp warm-up gate: timeout after {}s; probe {} returned []; continuing with not-fully-warm clangd (degrade, not fail)",
+                        timeout_s, WARMUP_PROBE_SYMBOL
+                    ),
+                );
+                return Ok(());
             }
             std::thread::sleep(Duration::from_millis(250));
         }

@@ -54,15 +54,19 @@ pub(crate) const CUMULATIVE_MD_REL: &str = "docs/plans/cumulative.md";
 /// Glob semantics mirror [`crate::lease::glob_match`]: `*` is a
 /// single-segment wildcard, `**` crosses segments.
 pub(crate) const RULE13_CARVEOUT_ALLOWLIST: &[&str] = &[
-    // Pure-data directories — bench fixtures, research notes,
-    // planning docs.
+    // Bench fixtures + harness data — no runtime invariant.
     "benchmark/**",
-    "docs/research/**",
-    "docs/plans/**",
-    // Cross-session shared planning + ledger state. No build
-    // surface, no runtime invariant; touched constantly by
-    // orchestrator + agent ledger updates.
-    "project/shared/**",
+    // Cross-session shared planning + ledger state. Per CLAUDE.md
+    // Rule 13, only the agent-ledger / followup-tracker-* /
+    // agent-ledger-archive-* files under project/shared/ qualify;
+    // every other project/shared/*.md path is reviewed by lattner
+    // at minimum. `docs/research/**` and `docs/plans/**` are
+    // EXPLICITLY NOT in the carveout (research findings have
+    // downstream behavioral consequences; plans drive subsequent
+    // dispatch waves), so both require single-voice review.
+    "project/shared/agent-ledger.md",
+    "project/shared/followup-tracker-*.md",
+    "project/shared/agent-ledger-archive-*.md",
     // Routing-policy + manual session-start checklist. Both are
     // pure prose / parameter docs read by parent CC at session
     // start; neither participates in any compile or test.
@@ -1252,17 +1256,44 @@ mod tests {
 
     #[test]
     fn carveout_eligible_when_all_paths_allowlisted() {
-        // (a) Mixed allowlisted entries: research doc + benchmark +
-        // plan.
+        // (a) Mixed allowlisted entries: benchmark + ledger +
+        // followup-tracker glob match + STARTUP.md.
         let paths = vec![
             "benchmark/foo.py".into(),
-            "docs/plans/x.md".into(),
-            "docs/research/y.md".into(),
+            "project/shared/agent-ledger.md".into(),
+            "project/shared/followup-tracker-2026-05-04.md".into(),
+            "STARTUP.md".into(),
+            "tools/routing-policy.md".into(),
         ];
         assert!(
             is_carveout_eligible(&paths),
             "all-allowlist should be carveout-eligible"
         );
+    }
+
+    #[test]
+    fn carveout_ineligible_for_docs_plans_and_research() {
+        // CLAUDE.md Rule 13: docs/plans/** and docs/research/** are
+        // EXPLICITLY NOT in the carveout — both require single-voice
+        // review (lattner / torvalds respectively). This test pins
+        // that exclusion: a regression that adds either path to
+        // RULE13_CARVEOUT_ALLOWLIST will flip these asserts and fail
+        // the suite. Negative cases on `core/src/lib.rs` cover the
+        // baseline non-doc shape.
+        for p in [
+            "docs/plans/2026-04-25-cropout-phase2.md",
+            "docs/plans/foo.md",
+            "docs/research/2026-05-04-libgit2-investigation.md",
+            "docs/research/y.md",
+            "project/shared/some-other-shared-doc.md",
+            "core/src/lib.rs",
+        ] {
+            let paths = vec![p.into()];
+            assert!(
+                !is_carveout_eligible(&paths),
+                "{p} must NOT be carveout-eligible per CLAUDE.md Rule 13"
+            );
+        }
     }
 
     #[test]

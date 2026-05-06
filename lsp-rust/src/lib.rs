@@ -7,6 +7,8 @@
 
 #![deny(missing_docs)]
 
+/// Compatibility helpers for legacy environment variable names.
+pub mod compat;
 pub mod lsp;
 pub mod mcp;
 pub mod rpc;

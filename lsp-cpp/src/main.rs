@@ -23,6 +23,7 @@
 
 use lsp_cpp::{
     clangd::{Clangd, IndexMode, BUILD_FULL_INDEX_DEFAULT_MAX_TUS},
+    compat::project_env,
     mcp, LspBackend, ShimError,
 };
 use std::path::PathBuf;
@@ -35,8 +36,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let mut project: String = std::env::var("LSP_PROJECT")
-        .unwrap_or_else(|_| "/path/to/project".into());
+    let mut project: String = project_env().unwrap_or_else(|| "/path/to/project".into());
     let mut mode_override: Option<IndexMode> = None;
     let mut index_file_override: Option<PathBuf> = None;
     let mut max_tus_override: Option<usize> = None;
@@ -287,23 +287,27 @@ fn default_index_file() -> String {
     format!("{home}/.cache/lsp-cpp-full-index/index.idx")
 }
 
-fn run_serve_mcp(mut backend: Clangd) -> Result<(), ShimError> {
-    // Eager spawn: bring clangd up + run the warm-up gate before the
-    // MCP loop accepts requests. Prior behaviour was lazy spawn on
-    // first dispatch, which paid spawn + initialize + seed-didOpen
-    // cost on the caller's first `workspace_symbol` and returned `[]`
-    // because seed-didOpen TUs hadn't finished parsing yet.
+fn run_serve_mcp(backend: Clangd) -> Result<(), ShimError> {
+    // Lazy spawn on first MCP dispatch (NOT eager-spawn).
     //
-    // `Clangd::spawn()` runs `seed_didopen()` followed by
-    // `wait_for_warm()` (clangd.rs); a successful return here means
-    // the symbol DB has a non-empty response for the curated probe
-    // symbol and subsequent dispatches are queryable on the first
-    // request. A `ShimError::WarmupTimeout` here is fatal for
-    // serve-mcp — a half-warm clangd is worse than a hard failure
-    // because it lies silently. The MCP transport receives the
-    // non-zero exit and the host (CC) can alarm.
-    use lsp_cpp::backend::LspBackend;
-    backend.spawn()?;
+    // 2026-05-04 incident: an earlier eager-spawn version of this
+    // function called backend.spawn() before serve_stdio. spawn()
+    // runs seed_didopen + wait_for_warm which can take 5-30s on a
+    // cold cache. CC's MCP host treats stdin-silence during that
+    // window as wrapper-unresponsive and closes stdin. serve_stdio
+    // then sees EOF, sends shutdown+exit to clangd (LSP-clean), and
+    // exits status 0. CC respawns into the same loop. The MCP
+    // transport returns empty results forever because the wrapper
+    // never gets to handle a single RPC.
+    //
+    // The right pattern: enter serve_stdio immediately so the MCP
+    // protocol stays responsive; lazy-spawn clangd on first dispatch
+    // (Clangd::spawn() still runs the warm-up gate, but inside the
+    // dispatch path so CC's stdin stays open while we warm). Soft-
+    // degrade in wait_for_warm() means first-RPC pays warm cost but
+    // returns Ok even on timeout — degraded clangd is better than
+    // fail-respawn-loop.
+    //
     // Owned backend hands off to the MCP loop, which holds it for the
     // lifetime of the stdio session (one long-lived clangd subprocess
     // per MCP session — see mcp.rs module docstring).

@@ -38,6 +38,8 @@
 
 pub mod backend;
 pub mod clangd;
+/// Compatibility helpers for legacy environment variable names.
+pub mod compat;
 pub mod error;
 pub mod jsonrpc;
 pub mod mcp;

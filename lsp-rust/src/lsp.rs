@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use thiserror::Error;
 
+use crate::compat::{log_file_env, rust_analyzer_env, timeout_env};
 use crate::rpc::{
     self, recv_frame, send_frame, RpcOutcome, LSP_ERROR_CONTENT_MODIFIED,
     LSP_ERROR_SERVER_CANCELLED,
@@ -148,9 +149,9 @@ impl RustAnalyzerClient {
     /// is the optional `--timeout-secs` override; it defeats the env var
     /// `LSP_TIMEOUT_SECS`, which in turn defeats the 60s default.
     pub fn new(workspace: impl Into<PathBuf>, cli_timeout: Option<u64>) -> Self {
-        let binary = std::env::var("LSP_RUST_ANALYZER")
+        let binary = rust_analyzer_env()
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("rust-analyzer"));
+            .unwrap_or_else(|| PathBuf::from("rust-analyzer"));
         let log_path = Self::resolve_log_path();
         Self {
             workspace: workspace.into(),
@@ -171,7 +172,7 @@ impl RustAnalyzerClient {
         if let Some(secs) = cli_override {
             return Duration::from_secs(secs);
         }
-        if let Ok(env_val) = std::env::var("LSP_TIMEOUT_SECS") {
+        if let Some(env_val) = timeout_env() {
             if let Ok(secs) = env_val.parse::<u64>() {
                 return Duration::from_secs(secs);
             }
@@ -183,9 +184,9 @@ impl RustAnalyzerClient {
     /// the default `/tmp/lsp-rust.log`. The file is opened
     /// append-mode on every spawn so concurrent shims do not clobber.
     pub fn resolve_log_path() -> PathBuf {
-        std::env::var("LSP_LOG_FILE")
+        log_file_env()
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(DEFAULT_LOG_PATH))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_PATH))
     }
 
     /// Path to the captured rust-analyzer stderr log.

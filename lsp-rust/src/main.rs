@@ -26,6 +26,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+use lsp_rust::compat::project_env;
 use lsp_rust::lsp::{LspShimError, RustAnalyzerClient};
 use lsp_rust::mcp;
 
@@ -106,7 +107,7 @@ fn main() -> ExitCode {
     let workspace = cli
         .workspace
         .clone()
-        .or_else(|| std::env::var("LSP_PROJECT").ok().map(PathBuf::from))
+        .or_else(|| project_env().map(PathBuf::from))
         .or_else(|| std::env::current_dir().ok());
     let workspace = match workspace {
         Some(w) => w,

@@ -20,6 +20,7 @@
 //!   symbol
 //! - `LSP_CPP_QUERY_SYMBOL` set to the symbol name to look up
 
+use lsp_cpp::compat::live_test_env;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -37,7 +38,7 @@ const RETRY_SLEEP_MS: u64 = 5000;
 const RETRY_TOTAL_MS: u64 = 120_000;
 
 fn live_test_enabled() -> bool {
-    std::env::var("LSP_CPP_LIVE_TEST")
+    live_test_env()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }

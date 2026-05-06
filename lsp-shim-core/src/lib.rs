@@ -35,5 +35,6 @@
 
 #![deny(missing_docs)]
 
+pub mod compat;
 pub mod framing;
 pub mod mcp_proto;

@@ -36,6 +36,10 @@ thiserror = { workspace = true }
 # via OS-managed entropy (avoids the process-id-XOR-clock-subsec
 # scheme that races under simultaneous lease emits).
 tempfile = "~3.27"
+# Provides the env_or_legacy helper that powers compat::*. Sharing
+# the helper with the LSP shims keeps the deprecation-note shape
+# identical across mcp-tools binaries.
+lsp-shim-core = { path = "../lsp-shim-core" }
 
 [dev-dependencies]
 # tempfile is in [dependencies] (used by lease.rs atomic-write).

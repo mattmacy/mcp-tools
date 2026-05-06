@@ -27,6 +27,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use wtpool::agents::{agent_inflight_summary, DEFAULT_STALE_MINUTES};
+use wtpool::compat::repo_root_env;
 use wtpool::git::{
     linked_worktree_paths, validate_worktree_path, worktree_list, worktree_state,
 };
@@ -268,7 +269,7 @@ fn main() -> ExitCode {
     let repo = cli
         .repo
         .clone()
-        .or_else(|| std::env::var("WTPOOL_REPO").ok().map(PathBuf::from))
+        .or_else(|| repo_root_env().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(DEFAULT_REPO));
 
     match cli.command {
