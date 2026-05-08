@@ -189,6 +189,21 @@ cargo build --release -p wtpool
 sudo install -m 755 target/release/wtpool /usr/local/bin/
 ```
 
+## Subagent template
+
+`wtpool/agents/worktree-worker.md` is a **Claude Code subagent
+template** that codifies the dispatch contract this server enforces:
+pool-first acquire, branch ↔ worktree consistency, no bash
+`git merge --no-ff` (use `merge_to_main` RPC instead), and the
+ban-list of dangerous git ops. Fill in the bracketed placeholders
+(`<WORKTREE_ROOT>`, `<wtpool-server>`, test/format commands) and
+register under your project's `.claude/agents/`.
+
+The template assumes foreground-only dispatch; a 2026-04-17 probe in
+the originating project found that background subagents are denied
+basic git invocations regardless of `permissionMode: bypassPermissions`.
+Retest before re-enabling background dispatch on a different harness.
+
 ## Git library backend
 
 `git2 ~= 0.20` with `vendored-libgit2` feature so the install does

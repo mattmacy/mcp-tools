@@ -118,6 +118,39 @@ cargo test -p codex-stdio
 Env-mutation tests share a process-global `ENV_LOCK` mutex so
 cargo's parallel thread-pool does not race them.
 
+## Recommended PreToolUse hooks
+
+Two hooks shipped under `codex-stdio/hooks/` codify dispatch patterns
+that are easy to get wrong and have user-visible consequences:
+
+| Hook | Blocks | Why |
+|---|---|---|
+| `block-tail-pipe-on-codex.sh` | Bash commands shaped `codex exec ... \| tail` | `tail` buffers; long codex runs hide all output until exit. |
+| `prevent-codex-sync-blocking.sh` | `mcp__codex-stdio__codex_run_task` and `mcp__codex__codex` MCP calls | Sync MCP RPC walls the parent. Use `Bash run_in_background=true` calling `codex exec` directly for parallel fanout. |
+
+Both fail-OPEN on infra errors (missing `jq` + missing `python3`,
+malformed JSON, empty stdin) — they're a belt for the suspenders, not
+the primary contract. Override with `TAIL_PIPE_OK=1` (per-command
+prefix) or `ALLOW_CODEX_SYNC=1` (env) respectively.
+
+Wire into your MCP client's PreToolUse hook chain. For Claude Code,
+add to `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash",
+        "hooks": [{"type": "command",
+                   "command": "/path/to/codex-stdio/hooks/block-tail-pipe-on-codex.sh"}]},
+      { "matcher": "mcp__codex-stdio__codex_run_task|mcp__codex__codex",
+        "hooks": [{"type": "command",
+                   "command": "/path/to/codex-stdio/hooks/prevent-codex-sync-blocking.sh"}]}
+    ]
+  }
+}
+```
+
 ## Security model
 
 Layered, in increasing order of trust (only layer 1 is in this
